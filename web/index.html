@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="spacewell-token" content="__TOKEN__"><title>留白 Spacewell · 本地存储管理</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body><aside class="sidebar"><a class="brand" href="#overview"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span>留白<span class="brand-en">SPACEWELL</span></span></a><div class="workspace-label">我的电脑 <span>LOCAL</span></div><nav id="navigation" aria-label="主导航"></nav><div class="sidebar-bottom"><div class="privacy"><span class="status-dot"></span> 只在这台电脑上运行</div><p>让空间回到你手里。</p><button class="plain sidebar-help" id="help-button">使用说明 <span>↗</span></button><span class="version">Spacewell / 1.0</span></div></aside>
+<div class="shell"><header class="topbar"><div class="breadcrumb">我的工作台 <span>/</span> <strong id="crumb">存储总览</strong></div><div class="top-actions"><span class="local-badge"><span class="status-dot"></span> 本地连接</span><button class="icon-button" id="export-button" title="导出分析结果" aria-label="导出分析结果"></button><div class="avatar">M</div></div></header>
+<main><div class="page-heading"><div><div class="eyebrow" id="eyebrow">YOUR SPACE, REIMAGINED</div><h1 id="page-title">给电脑，留一点空间。</h1><p id="page-subtitle">看清每一份占用，安心整理你的本地存储。</p></div><button class="button primary" id="scan-button"></button></div>
+<section id="job-panel" class="job-panel" hidden aria-live="polite"></section>
+<div id="content"><div class="loading-screen"><div class="spinner"></div><h3>正在读取本地磁盘快照</h3><p>所有分析与文件操作都留在本机。</p></div></div>
+<footer class="page-footer"><span><span class="status-dot"></span> 本地运行 · 无数据上传</span><span id="scan-time">准备读取…</span></footer></main></div>
+<dialog id="modal"><div id="modal-content"></div></dialog><div id="toasts" role="status" aria-live="polite"></div>
+</body></html>

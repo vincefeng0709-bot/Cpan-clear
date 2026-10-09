@@ -1,0 +1,10 @@
+reports/
+__pycache__/
+*.pyc
+.test-tmp/
+local-state/
+
+.env
+.env.*
+*.pem
+*.key

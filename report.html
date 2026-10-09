@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>磁盘体检 · 本地存储分析</title>
+<style>
+:root{font-family:system-ui,"Microsoft YaHei",sans-serif;color:#dce4ef;background:#10151e;color-scheme:dark}*{box-sizing:border-box}body{margin:0}main{max-width:1320px;margin:auto;padding:44px 32px}header{display:flex;justify-content:space-between;gap:20px;align-items:center}h1{font-size:32px;margin:8px 0}h2{font-size:20px;margin:30px 0 14px}.eyebrow{font-size:12px;letter-spacing:2px;color:#71dcc0}.muted,small{color:#99a9be}p{line-height:1.7}.badge{border:1px solid #416052;border-radius:30px;padding:8px 14px;color:#8de3bf;white-space:nowrap}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(225px,1fr));gap:16px}.card{background:#1b2432;border:1px solid #2b394b;border-radius:14px;padding:22px}.card strong{font-size:29px;display:block;margin:16px 0 6px}.bar{height:7px;background:#303d50;border-radius:10px;margin-top:20px;overflow:hidden}.bar div{height:100%;background:#6fc9b4}.warning{background:#2d261d;border-left:3px solid #e9b567;padding:14px 18px;color:#e5cca3;font-size:14px;margin:22px 0;line-height:1.8}nav{display:flex;gap:8px;flex-wrap:wrap;margin:26px 0}button,select,input{font:inherit;border:1px solid #38495e;border-radius:7px;background:#1b2432;color:#dce4ef;padding:10px 14px}button{cursor:pointer}button.active{background:#8de3bf;color:#12241e;border-color:#8de3bf}input{min-width:280px;flex:1}.tools{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}.tablewrap{overflow:auto;border:1px solid #2b394b;border-radius:12px}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;background:#1b2432;color:#aabbd0;padding:13px 16px;white-space:nowrap}td{padding:14px 16px;border-top:1px solid #283344;vertical-align:top}td.path{word-break:break-all;min-width:260px;max-width:560px;font-family:ui-monospace,Consolas,monospace}td.amount{white-space:nowrap;color:#8de3bf;font-variant-numeric:tabular-nums}td.action{min-width:270px;line-height:1.7}footer{font-size:12px;color:#99a9be;margin:32px 0;line-height:1.8}a{color:#8de3bf}.pill{display:inline-block;padding:3px 7px;border-radius:5px;background:#26364a;white-space:nowrap}.empty{padding:30px;color:#99a9be}#status{font-size:13px;margin:12px 0;color:#99a9be}@media(max-width:640px){main{padding:24px 16px}header{display:block}.badge{display:inline-block;margin-top:10px}h1{font-size:26px}}
+</style>
+<main><header><div><span class="eyebrow">LOCAL STORAGE / 磁盘体检</span><h1>空间都用在哪里了？</h1><p class="muted" id="meta"></p></div><span class="badge">只读扫描 · 数据留在本机</span></header>
+<section class="cards" id="volumes"></section>
+<div class="warning">目录显示的是文件逻辑大小，不是实际占用或承诺可释放空间；硬链接、压缩文件和稀疏文件会造成差异。父子目录相互包含，不能相加。扫描跳过链接、联接点及云占位文件，读取失败会明确记录。清理候选均需核对后处理。</div>
+<nav id="tabs"></nav><div class="tools"><input id="search" aria-label="搜索路径" placeholder="搜索路径，例如 .codex、Temp、Downloads"><select id="drive" aria-label="筛选磁盘"><option value="">全部磁盘</option></select></div>
+<p id="description" class="muted"></p><div id="status"></div><div class="tablewrap" id="table"></div>
+<footer>此报告不读取文件正文，不上传数据，也不执行删除或迁移。报告含本机路径，请勿公开上传。<br>Codex 资料：<a href="https://learn.chatgpt.com/docs/environments/git-worktrees">工作树管理</a> · <a href="https://learn.chatgpt.com/docs/config-file/config-advanced">配置目录</a>。具体迁移仍需验证当前 Windows 桌面版本。</footer></main>
+<script>
+const data=/*REPORT_DATA*/null;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const size=n=>{let sign=n<0?'-':'';n=Math.abs(n);return sign+(n/1073741824).toFixed(2)+' GiB'};
+const tabs={recommendations:'处理建议',directories:'大目录',largest:'大文件',codex:'Codex 专项',comparison:'空间变化',issues:'扫描盲区'};
+let current='recommendations';
+if(data){
+$('meta').textContent=`${data.finished} · ${data.files_scanned.toLocaleString()} 个文件 · ${data.directory_count.toLocaleString()} 个目录`;
+$('volumes').innerHTML=data.volumes.map(v=>{const percent=v.used/v.total*100;return `<article class="card"><span>${esc(v.path)} 本地磁盘</span><strong>${size(v.free)}</strong><small>可用 / 共 ${size(v.total)} · 已使用 ${percent.toFixed(1)}%</small><div class="bar"><div style="width:${percent}%;background:${percent>90?'#ec9a85':'#6fc9b4'}"></div></div></article>`}).join('');
+data.volumes.forEach(v=>{let o=document.createElement('option');o.value=v.path.toLowerCase();o.textContent=v.path;$('drive').append(o)});
+$('tabs').innerHTML=Object.entries(tabs).map(([k,v])=>`<button data-tab="${k}">${v}</button>`).join('');
+$('tabs').addEventListener('click',e=>{if(e.target.dataset.tab){current=e.target.dataset.tab;render()}});
+$('search').addEventListener('input',render);$('drive').addEventListener('change',render);
+function render(){
+document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===current));
+let rows=current==='comparison'?data.comparison.rows:current==='codex'?data.directories.filter(r=>/codex|openai/i.test(r.path)):data[current];
+const q=$('search').value.toLowerCase(),drive=$('drive').value;
+rows=rows.filter(r=>r.path.toLowerCase().includes(q)&&r.path.toLowerCase().startsWith(drive));
+const descriptions={recommendations:'这些是按已知路径识别的处理候选，含需保留的数据；未被识别的目录不代表可以删除。',directories:'显示最大的 3,000 个目录，可搜索与筛选；完整目录清单在同次扫描 JSON 中。大小包含子目录。',largest:'全扫描范围内最大的 200 个文件；大小和文件年龄不能单独证明可删。',codex:'在最大 3,000 个目录中筛选 Codex / OpenAI 相关路径。嵌套目录不可累加；首次扫描无法证明增长由安装 Codex 导致。',comparison:data.comparison.message,issues:'仅保留前 300 条样例。完整计数：'+JSON.stringify(data.issue_counts)+'。存在跳过或读取失败的目录，其已知大小不是完整总量。'};
+$('description').textContent=descriptions[current];
+$('status').textContent=`匹配 ${rows.length} 项 · 当前展示前 200 项 · 扫描范围：${data.roots.join('，')}`;
+let heads=current==='recommendations'?['路径','已知大小','类别','处理条件']:current==='issues'?['路径','原因','详情']:current==='comparison'?['路径','变化量']:['路径','已知大小','信息'];
+let body=rows.slice(0,200).map(r=>{let cells=`<td class="path">${esc(r.path)}</td>`;
+if(current==='issues')cells+=`<td>${esc(r.kind)}</td><td>${esc(r.detail)}</td>`;
+else if(current==='comparison')cells+=`<td class="amount">${r.delta>0?'+':''}${size(r.delta)}</td>`;
+else{cells+=`<td class="amount">${size(r.bytes)}${r.incomplete?'<br><small>存在未统计项</small>':''}</td>`;
+if(current==='recommendations')cells+=`<td><span class="pill">${esc(r.category)}</span></td><td class="action">${esc(r.action)}<br><small>${r.kind==='file'?'修改时间：'+esc(r.modified):'30 天未修改：'+size(r.old_bytes)+'（不等于可删除）'}</small></td>`;
+else cells+=`<td>${r.modified?'修改时间：'+esc(r.modified):`${r.files.toLocaleString()} 个文件 · 未统计项 ${r.incomplete}`}</td>`}
+return '<tr>'+cells+'</tr>'}).join('');
+$('table').innerHTML=rows.length?`<table><thead><tr>${heads.map(h=>'<th>'+h+'</th>').join('')}</tr></thead><tbody>${body}</tbody></table>`:'<div class="empty">没有匹配记录。可更换筛选条件或扫描范围。</div>';
+}render();
+}
+</script></html>
