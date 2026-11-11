@@ -31,8 +31,13 @@ const base = p => p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p;
 const titles = {clean:['清理中心','缓存与临时文件已分类列出，可一键移入回收站；个人文件在空间分析中勾选处理。'],analyze:['空间分析','逐层浏览目录与全部大文件，勾选后批量移入回收站或永久删除。'],history:['操作记录','每次清理、删除与迁移的结果都在这里；已转移文件可恢复。'],move:['跨盘迁移','把不常用的大目录复制校验后转移到其他磁盘，释放 C 盘空间。']};
 const jobLabels = {scan:'扫描本地存储', move:'跨盘迁移', clean:'转移至恢复区', restore:'恢复文件', recycle:'移入回收站', junk:'一键清理', purge:'永久删除'};
 const statusLabels = {done:'已完成', error:'部分失败', cancelled:'已取消', running:'执行中', restoring:'恢复中', restored:'已恢复', restore_error:'恢复未完成', interrupted:'上次中断'};
-const state = {view:'clean', summary:null, junk:null, drive:'C:\\', path:'C:\\', scope:null, revision:0, query:'', offset:0, sort:'size', analyzeTab:'folders', historyTab:'operations', min:0, files:[], browse:null, request:0, lastJob:'', plan:null, recyclePlan:null, batchPaths:[], pendingRender:false, lastScroll:0};
+const state = {view:'clean', summary:null, junk:null, drive:'C:\\', path:'C:\\', scope:null, revision:0, query:'', offset:0, sort:'size', analyzeTab:'folders', historyTab:'operations', min:0, files:[], browse:null, request:0, lastJob:'', plan:null, recyclePlan:null, batchPaths:[], pendingRender:false, lastScroll:0, jobDismissed:false};
 const selectedFiles = new Map();
+// 每个区域最后一次实际写入 DOM 的数据指纹：轮询回来数据没变就跳过写入，
+// 界面保持静止，只有数据真正变化时才重画对应区块。
+const painted = {head:'', nav:'', job:'', clean:'', cleanOps:'', analyzeToolbar:'', analyzeBody:'', history:'', move:''};
+function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
+function resetPainted() {painted.clean=painted.cleanOps=painted.analyzeToolbar=painted.analyzeBody=painted.history=painted.move='';}
 async function api(path, data) {
   const res = await fetch('/api/'+path, {method:data === undefined?'GET':'POST', headers:{'X-Spacewell-Token':token, ...(data === undefined?{}:{'Content-Type':'application/json'})}, body:data === undefined?undefined:JSON.stringify(data)});
   const value = await res.json();
@@ -57,22 +62,33 @@ async function refresh() {
     state.drive = summary.volumes.find(v => state.scope.toLowerCase().startsWith(v.path.toLowerCase()))?.path || state.drive;
   }
   const stamp = summary.live_updated || summary.finished;
-  $('#scan-time').textContent = stamp ? '数据更新 ' + new Date(stamp).toLocaleString('zh-CN',{hour12:false}) : '';
-  $('.local-badge').textContent = summary.monitor?.status === 'limited' ? '自动更新受限' : '自动更新已开启';
-  $('.local-badge').title = summary.monitor?.message || '';
+  setText($('#scan-time'), stamp ? '数据更新 ' + new Date(stamp).toLocaleString('zh-CN',{hour12:false}) : '');
+  const badge = $('.local-badge');
+  const badgeText = summary.monitor?.status === 'limited' ? '自动更新受限' : '自动更新已开启';
+  if (badge.textContent !== badgeText) badge.textContent = badgeText;
+  badge.title = summary.monitor?.message || '';
   renderJob(summary.job);
 }
 function folderScope() {return !!state.scope && !/^[a-z]:[\\/]*$/i.test(state.scope);}
 function inScope(path) {const scope=(folderScope()?state.scope:state.drive).toLowerCase().replace(/[\\/]+$/,'');return path.toLowerCase()===scope||path.toLowerCase().startsWith(scope+'\\');}
-function navigate() {state.view=location.hash.slice(1) in titles?location.hash.slice(1):'clean';state.query='';state.offset=0;render();}
+// 磁盘可用空间的原始字节数每次请求都在抖动；指纹只取磁盘卡片显示的 0.1 GiB 档位，
+// 显示没变化就不重建工具栏，避免整页重画。
+function volumeKey() {return JSON.stringify(state.summary.volumes.map(v=>[v.path, gib(v.free), Math.round(v.used/v.total*100)]));}
+function navigate() {state.view=location.hash.slice(1) in titles?location.hash.slice(1):'clean';state.query='';state.offset=0;resetPainted();render();}
 function driveOptions(selected=state.drive, all=false) {return (all?'<option value="">全部磁盘</option>':'')+state.summary.volumes.map(v=>`<option value="${esc(v.path)}" ${v.path===selected?'selected':''}>${esc(v.path)} · ${fmt(v.free)} 可用</option>`).join('');}
 function render() {
   if (!state.summary) return;
   const [title, subtitle] = titles[state.view];
-  $('#crumb').textContent = title; $('#page-title').textContent = title; $('#page-subtitle').textContent = subtitle;
-  $('#navigation').innerHTML = Object.entries(titles).map(([v, t]) => `<button class="nav-item ${v===state.view?'active':''}" data-action="nav" data-view="${v}" title="${t[0]}">${icon(v)}<span>${t[0]}</span></button>`).join('');
+  if (painted.head !== title) {
+    painted.head = title;
+    $('#crumb').textContent = title; $('#page-title').textContent = title; $('#page-subtitle').textContent = subtitle;
+  }
+  if (painted.nav !== state.view) {
+    painted.nav = state.view;
+    $('#navigation').innerHTML = Object.entries(titles).map(([v, t]) => `<button class="nav-item ${v===state.view?'active':''}" data-action="nav" data-view="${v}" title="${t[0]}">${icon(v)}<span>${t[0]}</span></button>`).join('');
+  }
   const handlers = {clean:renderClean, analyze:renderAnalyze, history:renderHistory, move:renderMove};
-  Promise.resolve(handlers[state.view]()).catch(e => {$('#content').innerHTML = empty('读取遇到问题', esc(e.message)); toast(e.message, true);});
+  Promise.resolve(handlers[state.view]()).catch(e => {resetPainted(); $('#content').innerHTML = empty('读取遇到问题', esc(e.message)); toast(e.message, true);});
 }
 function driveStrip() {
   return `<div class="drive-strip" id="drive-strip">${state.summary.volumes.map(v => {
@@ -100,11 +116,15 @@ function junkCard(c) {
 async function renderClean() {
   const request = ++state.request;
   const junk = state.junk;
-  $('#content').innerHTML = `${driveStrip()}${!state.summary.snapshot?notice('尚未完整扫描磁盘。垃圾清理与大文件功能现在即可使用；完整扫描可为目录浏览提供体积数据。'):''}<div class="clean-grid"><section class="panel junk-panel"><div class="panel-head"><div><h2>垃圾文件分类</h2><p>${junk?.generated?'统计于 '+new Date(junk.generated).toLocaleString('zh-CN',{hour12:false}):'常见缓存与临时文件 · 只读统计'}</p></div>${junk?.status==='scanning'?'<div class="spinner small"></div>':''}</div><div class="junk-list">${junkCards()}</div><div class="tiny-note">一键清理把缓存内容移入 Windows 回收站，可随时恢复；正在使用的文件自动跳过，浏览器运行时建议先关闭浏览器。</div></section><aside class="panel recycle-panel"><div class="panel-head"><h2>回收站</h2></div>${recyclePanel(junk?.recycle)}<div class="panel-foot">${button('清空回收站','recycle-empty','','danger-soft')}${button('打开回收站','system','data-system="recycle"','soft')}</div><div class="tiny-note">移入回收站的文件仍占用磁盘空间，清空回收站后才会真正释放。</div></aside></div><div class="section-heading"><h2>最近操作</h2><button class="text-button" data-action="nav" data-view="history">全部记录 ${icon('arrow')}</button></div><div id="recent-ops">${loading()}</div>`;
+  const key = JSON.stringify([state.drive, volumeKey(), !!state.summary.snapshot, junk]);
+  if (painted.clean !== key) { painted.clean = key; painted.cleanOps = ''; $('#content').innerHTML = `${driveStrip()}${!state.summary.snapshot?notice('尚未完整扫描磁盘。垃圾清理与大文件功能现在即可使用；完整扫描可为目录浏览提供体积数据。'):''}<div class="clean-grid"><section class="panel junk-panel"><div class="panel-head"><div><h2>垃圾文件分类</h2><p>${junk?.generated?'统计于 '+new Date(junk.generated).toLocaleString('zh-CN',{hour12:false}):'常见缓存与临时文件 · 只读统计'}</p></div>${junk?.status==='scanning'?'<div class="spinner small"></div>':''}</div><div class="junk-list">${junkCards()}</div><div class="tiny-note">一键清理把缓存内容移入 Windows 回收站，可随时恢复；正在使用的文件自动跳过，浏览器运行时建议先关闭浏览器。</div></section><aside class="panel recycle-panel"><div class="panel-head"><h2>回收站</h2></div>${recyclePanel(junk?.recycle)}<div class="panel-foot">${button('清空回收站','recycle-empty','','danger-soft')}${button('打开回收站','system','data-system="recycle"','soft')}</div><div class="tiny-note">移入回收站的文件仍占用磁盘空间，清空回收站后才会真正释放。</div></aside></div><div class="section-heading"><h2>最近操作</h2><button class="text-button" data-action="nav" data-view="history">全部记录 ${icon('arrow')}</button></div><div id="recent-ops">${loading()}</div>`; }
   try {
     const rows = await api('history');
     if (request !== state.request || state.view !== 'clean') return;
-    $('#recent-ops').innerHTML = rows.length ? `<div class="mini-history">${rows.slice(0, 4).map(historyRow).join('')}</div>` : '<div class="muted-line">暂无操作记录</div>';
+    const opsKey = JSON.stringify(rows.slice(0, 4));
+    if (painted.cleanOps === opsKey) return;
+    painted.cleanOps = opsKey;
+    if ($('#recent-ops')) $('#recent-ops').innerHTML = rows.length ? `<div class="mini-history">${rows.slice(0, 4).map(historyRow).join('')}</div>` : '<div class="muted-line">暂无操作记录</div>';
   } catch (e) { if ($('#recent-ops')) $('#recent-ops').innerHTML = `<div class="muted-line">${esc(e.message)}</div>`; }
 }
 function fileTable(rows, operations=true) {
@@ -112,22 +132,50 @@ function fileTable(rows, operations=true) {
   const total = [...selectedFiles.values()].reduce((a,b)=>a+b,0);
   return `<div class="batch-bar"><label><input type="checkbox" id="select-page" aria-label="全选当前页" ${rows.filter(r=>!r.linked).length&&rows.filter(r=>!r.linked).every(r=>selectedFiles.has(r.path))?'checked':''}> 全选当前页</label><span id="selection-count">已选 ${selectedFiles.size} 项 · ${fmt(total)}</span>${button('移入回收站','batch-recycle',selectedFiles.size?'':'disabled','small primary')}${button('永久删除','batch-purge',selectedFiles.size?'':'disabled','small danger-soft')}${selectedFiles.size?button('取消选择','clear-selection','','small'):''}</div><div class="table-wrap"><table><thead><tr><th class="check-cell">选择</th><th>文件 / 目录</th><th>体积</th><th>类型</th><th class="right-align">操作</th></tr></thead><tbody>${rows.map(r=>`<tr class="${selectedFiles.has(r.path)?'is-selected':''}"><td class="check-cell"><input type="checkbox" class="file-check" aria-label="选择 ${esc(r.name||base(r.path))}" data-path="${esc(r.path)}" data-bytes="${r.bytes||0}" ${selectedFiles.has(r.path)?'checked':''} ${r.linked?'disabled':''}></td><td><div class="file-cell"><span class="file-icon ${r.directory?'folder':''}">${icon(r.directory?'folder':'file')}</span><div><button class="plain file-name" title="${esc(r.path)}" data-action="${r.directory&&!r.linked?'explore':'details'}" data-path="${esc(r.path)}">${esc(r.name||base(r.path))}</button><span class="file-path" title="${esc(r.path)}">${esc(r.path)}</span></div></div></td><td class="amount">${fmt(r.bytes)}${r.incomplete?'<br><span class="tag neutral">统计不完整</span>':''}</td><td><span class="tag ${r.linked?'warn':'neutral'}">${r.linked?'链接 / 受限':r.directory?'文件夹':'文件'}</span></td><td><div class="row-actions"><button class="text-button" data-action="open" data-path="${esc(r.path)}" title="在资源管理器中选中">定位 ${icon('external')}</button>${operations?`<button class="text-button" data-action="details" data-path="${esc(r.path)}">管理 ${icon('arrow')}</button>`:`<button class="text-button" data-action="explore" data-path="${esc(r.path)}">查看 ${icon('arrow')}</button>`}</div></td></tr>`).join('')}</tbody></table></div>`;
 }
+function analyzeToolbar(tab) {
+  return `<div class="toolbar"><div class="segmented"><button data-action="analyze-tab" data-tab="folders" class="${tab==='folders'?'active':''}">目录浏览</button><button data-action="analyze-tab" data-tab="large" class="${tab==='large'?'active':''}">大文件</button></div><select class="select" id="drive-select" aria-label="磁盘">${driveOptions()}</select><div class="search-field">${icon('search')}<input class="field" id="query" value="${esc(state.query)}" placeholder="搜索${tab==='folders'?'当前目录':'大文件路径'}…" aria-label="搜索"></div>${tab==='large'?`<select id="size-select" class="select" aria-label="最小文件大小"><option value="0">所有体积</option><option value="104857600" ${state.min===104857600?'selected':''}>100 MiB 以上</option><option value="1073741824" ${state.min===1073741824?'selected':''}>1 GiB 以上</option><option value="5368709120" ${state.min===5368709120?'selected':''}>5 GiB 以上</option></select>`:''}</div>`;
+}
+function analyzeFoldersBody(data) {
+  const sum = data.chart.reduce((a,r)=>a+r.bytes,0) || 1;
+  return `<div class="path-bar"><button class="icon-button" data-action="up" title="上一级" aria-label="上一级">${icon('back')}</button><input id="path-input" aria-label="当前目录，输入后回车" value="${esc(data.path)}"><button class="text-button" data-action="open" data-path="${esc(data.path)}">资源管理器 ${icon('external')}</button></div>${data.chart.length?`<div class="mini-chart" aria-label="子目录相对体积">${data.chart.slice(0,8).map((r,i)=>`<button class="chart-tile" data-action="explore" data-path="${esc(r.path)}" title="${esc(r.path)} · ${fmt(r.bytes)}" style="flex:${Math.max(.06,r.bytes/sum)};background:${colors[i]}"><strong>${esc(base(r.path))}</strong><span>${fmt(r.bytes)}</span></button>`).join('')}</div>`:''}<section class="panel">${fileTable(data.items)}<div class="table-footer"><span>${data.total.toLocaleString()} 项 · 目录体积随文件变化自动更新</span><div>${button('上一页','prev','','small')}${button('下一页','next',state.offset+100>=data.total?'disabled':'','small')}</div></div></section>`;
+}
+function analyzeLargeBody(data) {
+  return notice(`当前范围 ${esc(folderScope()?state.scope:state.drive)} · 保存最多 2,000 个大文件，匹配 ${data.items.length} 项。体积大不代表可以删除，请先确认文件用途。`)+`<section class="panel">${fileTable(data.items.slice(state.offset,state.offset+100))}<div class="table-footer"><span>按体积从大到小 · ${data.items.length} 项</span><div>${button('上一页','prev','','small')}${button('下一页','next',state.offset+100>=data.items.length?'disabled':'','small')}</div></div></section>`;
+}
+// 指纹只取界面显示的字段：字节的原始数值抖动几十 KB 在 GiB 显示里毫无变化，
+// 未显示的 modified 时间戳也一直在变；按显示值取指纹才能在数据微动时保持 DOM 静止。
+const displayRow = r => [r.path, r.name||'', r.directory?1:0, r.linked?1:0, r.incomplete?1:0, fmt(r.bytes)];
 async function renderAnalyze() {
   const request = ++state.request;
-  $('#content').innerHTML = `<div class="toolbar"><div class="segmented"><button data-action="analyze-tab" data-tab="folders" class="${state.analyzeTab==='folders'?'active':''}">目录浏览</button><button data-action="analyze-tab" data-tab="large" class="${state.analyzeTab==='large'?'active':''}">大文件</button></div><select class="select" id="drive-select" aria-label="磁盘">${driveOptions()}</select><div class="search-field">${icon('search')}<input class="field" id="query" value="${esc(state.query)}" placeholder="搜索${state.analyzeTab==='folders'?'当前目录':'大文件路径'}…" aria-label="搜索"></div>${state.analyzeTab==='large'?`<select id="size-select" class="select" aria-label="最小文件大小"><option value="0">所有体积</option><option value="104857600" ${state.min===104857600?'selected':''}>100 MiB 以上</option><option value="1073741824" ${state.min===1073741824?'selected':''}>1 GiB 以上</option><option value="5368709120" ${state.min===5368709120?'selected':''}>5 GiB 以上</option></select>`:''}</div><div id="analysis-body">${loading()}</div>`;
-  if (state.analyzeTab === 'folders') {
-    const data = await api(`browse?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent(state.query)}&offset=${state.offset}&sort=${state.sort}`);
+  const tab = state.analyzeTab;
+  const toolbarKey = JSON.stringify([tab, state.drive, state.query, state.min, volumeKey()]);
+  let data;
+  if (tab === 'folders') {
+    data = await api(`browse?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent(state.query)}&offset=${state.offset}&sort=${state.sort}`);
     if (request !== state.request || state.view !== 'analyze') return;
     state.browse = data;
-    const sum = data.chart.reduce((a,r)=>a+r.bytes,0) || 1;
-    $('#analysis-body').innerHTML = `<div class="path-bar"><button class="icon-button" data-action="up" title="上一级" aria-label="上一级">${icon('back')}</button><input id="path-input" aria-label="当前目录，输入后回车" value="${esc(data.path)}"><button class="text-button" data-action="open" data-path="${esc(data.path)}">资源管理器 ${icon('external')}</button></div>${data.chart.length?`<div class="mini-chart" aria-label="子目录相对体积">${data.chart.slice(0,8).map((r,i)=>`<button class="chart-tile" data-action="explore" data-path="${esc(r.path)}" title="${esc(r.path)} · ${fmt(r.bytes)}" style="flex:${Math.max(.06,r.bytes/sum)};background:${colors[i]}"><strong>${esc(base(r.path))}</strong><span>${fmt(r.bytes)}</span></button>`).join('')}</div>`:''}<section class="panel">${fileTable(data.items)}<div class="table-footer"><span>${data.total.toLocaleString()} 项 · 目录体积随文件变化自动更新</span><div>${button('上一页','prev','','small')}${button('下一页','next',state.offset+100>=data.total?'disabled':'','small')}</div></div></section>`;
   } else {
     const scopeParam = folderScope() ? state.scope : '';
-    const data = await api(`files?drive=${encodeURIComponent(state.drive)}&scope=${encodeURIComponent(scopeParam)}&q=${encodeURIComponent(state.query)}&min=${state.min}`);
+    data = await api(`files?drive=${encodeURIComponent(state.drive)}&scope=${encodeURIComponent(scopeParam)}&q=${encodeURIComponent(state.query)}&min=${state.min}`);
     if (request !== state.request || state.view !== 'analyze') return;
     state.files = data.items;
-    $('#analysis-body').innerHTML = notice(`当前范围 ${esc(folderScope()?state.scope:state.drive)} · 保存最多 2,000 个大文件，匹配 ${data.items.length} 项。体积大不代表可以删除，请先确认文件用途。`)+`<section class="panel">${fileTable(data.items.slice(state.offset,state.offset+100))}<div class="table-footer"><span>按体积从大到小 · ${data.items.length} 项</span><div>${button('上一页','prev','','small')}${button('下一页','next',state.offset+100>=data.items.length?'disabled':'','small')}</div></div></section>`;
   }
+  const body = tab === 'folders' ? analyzeFoldersBody(data) : analyzeLargeBody(data);
+  const page = tab === 'folders'
+    ? {path: data.path, total: data.total, chart: data.chart.map(displayRow), items: data.items.map(displayRow)}
+    : {length: data.items.length, page: data.items.slice(state.offset, state.offset+100).map(displayRow)};
+  const bodyKey = JSON.stringify([toolbarKey, state.scope, state.offset, page]);
+  if (painted.analyzeBody === bodyKey && $('#analysis-body')) return;
+  painted.analyzeBody = bodyKey;
+  // 写入发生在 await 之后，先记下正在输入的框，写入后把焦点和光标还回去。
+  const focusId = document.activeElement && ['query','path-input'].includes(document.activeElement.id) ? document.activeElement.id : '';
+  if (painted.analyzeToolbar !== toolbarKey || !$('#analysis-body')) {
+    painted.analyzeToolbar = toolbarKey;
+    $('#content').innerHTML = `${analyzeToolbar(tab)}<div id="analysis-body">${body}</div>`;
+  } else {
+    $('#analysis-body').innerHTML = body;
+  }
+  if (focusId) {const el=document.getElementById(focusId);if(el){el.focus();el.setSelectionRange(el.value.length,el.value.length);}}
 }
 function recCard(r) {
   const allowed = r.policy?.allowed;
@@ -135,6 +183,9 @@ function recCard(r) {
 }
 function renderMove() {
   ++state.request;
+  const key = JSON.stringify([state.drive, state.scope, volumeKey(), state.summary.recommendations]);
+  if (painted.move === key) return;
+  painted.move = key;
   const rows = state.summary.recommendations.filter(r=>r.category==='迁移候选'&&inScope(r.path));
   $('#content').innerHTML = notice('迁移会逐文件复制并核验内容，然后移除源文件。源空目录保留，不自动修改应用配置；模型迁移前请退出对应应用。')+`<div class="toolbar"><select class="select" id="drive-select" aria-label="源磁盘">${driveOptions()}</select><span style="flex:1"></span>${button(icon('folder')+' 选择其他目录','custom-move','','soft')}</div><div class="section-heading"><h2>适合规划迁移的数据</h2><span>根据已知目录用途识别，执行前仍需核对</span></div><div class="recommendations">${rows.length?rows.map(r=>recCard(r)).join(''):empty('没有已识别的迁移候选','扫描 C 盘后查看建议，也可以手动选择受支持的个人资料目录。')}</div>`;
 }
@@ -149,21 +200,25 @@ function historyRow(r) {
 function comparison(data) {if(!data?.rows?.length)return empty('尚无可比较的变化',esc(data?.message||'选择历史快照开始比较。'));return `<section class="panel"><div class="table-wrap"><table><thead><tr><th>目录</th><th>空间变化</th></tr></thead><tbody>${data.rows.map(r=>`<tr><td><span class="file-path" title="${esc(r.path)}">${esc(r.path)}</span></td><td class="comparison-size ${r.delta>0?'positive':'negative'}">${r.delta>0?'+':'−'}${fmt(Math.abs(r.delta))}</td></tr>`).join('')}</tbody></table></div></section>`;}
 async function renderHistory() {
   const request = ++state.request;
-  $('#content').innerHTML = `<div class="toolbar"><div class="segmented"><button data-action="history-tab" data-tab="operations" class="${state.historyTab==='operations'?'active':''}">操作记录</button><button data-action="history-tab" data-tab="snapshots" class="${state.historyTab==='snapshots'?'active':''}">快照对比</button><button data-action="history-tab" data-tab="issues" class="${state.historyTab==='issues'?'active':''}">扫描盲区</button></div></div><div id="history-body">${loading()}</div>`;
-  if (state.historyTab === 'operations') {
-    const rows = await api('history');
-    if (request !== state.request) return;
-    $('#history-body').innerHTML = rows.length ? notice('恢复只处理原记录中的文件，遇到内容变化或同名冲突时停止，不会覆盖现有文件。')+`<div class="history-list">${rows.map(historyRow).join('')}</div>` : empty('还没有操作记录','从清理中心、空间分析或跨盘迁移开始；所有结果都会留在这里。');
-  } else if (state.historyTab === 'snapshots') {
-    const rows = await api('snapshots');
-    if (request !== state.request) return;
-    $('#history-body').innerHTML = notice('比较当前快照与所选历史快照。仅比较两次都完整读取的同名目录；父子目录相互包含，变化量不能相加。')+`<div class="toolbar"><select class="select" id="snapshot-select" aria-label="历史快照">${rows.map(r=>`<option value="${esc(r.name)}">${esc(r.name)}${r.name===state.summary.snapshot?' · 当前':''}</option>`).join('')}</select>${button('比较快照','compare','','soft')}</div><div id="comparison-results">${comparison(state.summary.comparison)}</div>`;
+  const tab = state.historyTab;
+  let payload;
+  if (tab === 'operations') payload = await api('history');
+  else if (tab === 'snapshots') payload = await api('snapshots');
+  else payload = await api('issues');
+  if (request !== state.request || state.view !== 'history') return;
+  const bodyKey = JSON.stringify([tab, payload, state.summary.snapshot, state.summary.comparison]);
+  if (painted.history === bodyKey) return;
+  painted.history = bodyKey;
+  let body;
+  if (tab === 'operations') {
+    body = payload.length ? notice('恢复只处理原记录中的文件，遇到内容变化或同名冲突时停止，不会覆盖现有文件。')+`<div class="history-list">${payload.map(historyRow).join('')}</div>` : empty('还没有操作记录','从清理中心、空间分析或跨盘迁移开始；所有结果都会留在这里。');
+  } else if (tab === 'snapshots') {
+    body = notice('比较当前快照与所选历史快照。仅比较两次都完整读取的同名目录；父子目录相互包含，变化量不能相加。')+`<div class="toolbar"><select class="select" id="snapshot-select" aria-label="历史快照">${payload.map(r=>`<option value="${esc(r.name)}">${esc(r.name)}${r.name===state.summary.snapshot?' · 当前':''}</option>`).join('')}</select>${button('比较快照','compare','','soft')}</div><div id="comparison-results">${comparison(state.summary.comparison)}</div>`;
   } else {
-    const data = await api('issues');
-    if (request !== state.request) return;
     const names = {link_or_cloud:'链接 / 云占位', unreadable:'读取失败', excluded:'主动排除', volume_unreadable:'磁盘不可读'};
-    $('#history-body').innerHTML = notice('以下最多展示前 300 条问题样例。扫描不会提权、更改权限或下载云文件。')+`<section class="panel"><div class="summary-strip">${Object.entries(data.counts).map(([k,n])=>`<div><small>${names[k]||esc(k)}</small><strong>${n.toLocaleString()}</strong></div>`).join('')}</div><div class="table-wrap"><table><thead><tr><th>路径</th><th>原因</th></tr></thead><tbody>${data.items.map(r=>`<tr><td><span class="file-path" style="max-width:700px" title="${esc(r.path)}">${esc(r.path)}</span></td><td><span class="tag neutral">${names[r.kind]||esc(r.kind)}</span></td></tr>`).join('')}</tbody></table></div></section>`;
+    body = notice('以下最多展示前 300 条问题样例。扫描不会提权、更改权限或下载云文件。')+`<section class="panel"><div class="summary-strip">${Object.entries(payload.counts).map(([k,n])=>`<div><small>${names[k]||esc(k)}</small><strong>${n.toLocaleString()}</strong></div>`).join('')}</div><div class="table-wrap"><table><thead><tr><th>路径</th><th>原因</th></tr></thead><tbody>${payload.items.map(r=>`<tr><td><span class="file-path" style="max-width:700px" title="${esc(r.path)}">${esc(r.path)}</span></td><td><span class="tag neutral">${names[r.kind]||esc(r.kind)}</span></td></tr>`).join('')}</tbody></table></div></section>`;
   }
+  $('#content').innerHTML = `<div class="toolbar"><div class="segmented"><button data-action="history-tab" data-tab="operations" class="${tab==='operations'?'active':''}">操作记录</button><button data-action="history-tab" data-tab="snapshots" class="${tab==='snapshots'?'active':''}">快照对比</button><button data-action="history-tab" data-tab="issues" class="${tab==='issues'?'active':''}">扫描盲区</button></div></div><div id="history-body">${body}</div>`;
 }
 function modal(title, body, footer=''){$('#modal-content').innerHTML=`<div class="modal-head"><h2>${title}</h2><button class="icon-button" data-action="close" aria-label="关闭">${icon('close')}</button></div><div class="modal-body">${body}</div>${footer?`<div class="modal-foot">${button('取消','close')}${footer}</div>`:''}`;if(!$('#modal').open)$('#modal').showModal();}
 async function details(path) {
@@ -184,8 +239,13 @@ async function makePlan(){
 function scanForm(){modal('更新磁盘分析',`<p>扫描只读取文件元数据，不修改任何文件；垃圾清理不依赖完整扫描。可以随时取消并保留上次结果。</p><div class="scan-options">${state.summary.volumes.map(v=>`<label><input type="checkbox" name="scan-root" value="${esc(v.path)}" ${v.path===state.drive?'checked':''}>${esc(v.path)} · ${fmt(v.free)} 可用</label>`).join('')}</div><label for="scan-custom">或只扫描一个目录（填写后优先使用）</label><input type="text" id="scan-custom" class="field" value="${esc(folderScope()?state.scope:'')}" placeholder="例如 C:\\Users\\YourName\\Downloads"><p>完整磁盘扫描可能需要几分钟。联接点、云占位和无权限项会被跳过并记录。</p>`,button('开始扫描','start-scan','','primary'));}
 function renderJob(job) {
   const panel=$('#job-panel');
-  if(!job||job.status==='idle'){panel.hidden=true;return;}
+  if(!job||job.status==='idle'){if(painted.job!=='idle'){painted.job='idle';panel.hidden=true;}return;}
   const running=job.status==='running';
+  if(running)state.jobDismissed=false;
+  const key=JSON.stringify([job, state.jobDismissed]);
+  if(painted.job===key)return;
+  painted.job=key;
+  if(state.jobDismissed&&!running){panel.hidden=true;return;}
   panel.hidden=false;
   panel.innerHTML=`${running?'<div class="spinner"></div>':icon(job.status==='done'?'check':'info')}<div class="job-info"><strong>${jobLabels[job.kind]||'操作'} · ${running?(job.kind==='scan'?`${(job.files||0).toLocaleString()} 个文件 / ${(job.directories||0).toLocaleString()} 个目录`:`${job.done||0} / ${job.total||0} 项`):job.status==='done'?'完成':job.status==='cancelled'?'已取消':'遇到问题'}</strong><p title="${esc(job.message)}">${esc(job.message)}</p>${running&&job.total?`<div class="progress-track"><div style="width:${Math.min(100,job.done/Math.max(1,job.total)*100)}%"></div></div>`:''}</div>${running?button('停止','cancel','','small'):button('收起','dismiss-job','','small')}`;
   $('#scan-button').disabled=running;
@@ -279,7 +339,7 @@ async function poll(force=false) {
       const summary=await api('summary');
       state.summary=summary;state.revision=summary.revision;
       const stamp=summary.live_updated||summary.finished;
-      $('#scan-time').textContent=stamp?'数据更新 '+new Date(stamp).toLocaleString('zh-CN',{hour12:false}):'';
+      setText($('#scan-time'),stamp?'数据更新 '+new Date(stamp).toLocaleString('zh-CN',{hour12:false}):'');
       renderLive();
     } else if (state.pendingRender)renderLive();
     state.lastJob=job.status;
@@ -317,7 +377,7 @@ async function action(name, el) {
   else if(name==='execute'){await api('execute',{id:state.plan.id,confirm:$('#confirm-operation').checked});$('#modal').close();state.lastJob='running';renderJob(await api('job'));}
   else if(name==='start-scan'){const custom=$('#scan-custom').value.trim();const roots=custom?[custom]:$$('[name="scan-root"]:checked').map(e=>e.value);if(!roots.length)throw new Error('请选择至少一个磁盘');await api('scan',{roots});$('#modal').close();state.lastJob='running';renderJob(await api('job'));}
   else if(name==='cancel'){await api('cancel',{});toast('正在安全停止，当前步骤完成后生效');}
-  else if(name==='dismiss-job')$('#job-panel').hidden=true;
+  else if(name==='dismiss-job'){state.jobDismissed=true;painted.job='';$('#job-panel').hidden=true;}
   else if(name==='restore-form'){modal('恢复到原位置',`<p>将这次操作中的文件复制回原位置并核验，然后移除目标副本。原位置存在不同内容的文件时会停止，不会覆盖。</p>${notice('请关闭正在使用这些文件的应用，并确认原磁盘有足够空间。',true)}`,button('确认恢复','restore',`data-id="${esc(d.id)}"`,'primary'));}
   else if(name==='restore'){await api('restore',{id:d.id,confirm:true});$('#modal').close();state.lastJob='running';renderJob(await api('job'));}
   else if(name==='compare'){const data=await api('compare',{snapshot:$('#snapshot-select').value});$('#comparison-results').innerHTML=comparison(data);}
@@ -340,7 +400,7 @@ document.addEventListener('change',e=>{
   if(e.target.id==='confirm-junk'){const b=$('[data-action="junk-go"]');if(b)b.disabled=!e.target.checked;}
 });
 let searchTimer;
-document.addEventListener('input',e=>{if(e.target.id==='query'){state.query=e.target.value;state.offset=0;clearTimeout(searchTimer);searchTimer=setTimeout(()=>{const value=state.query;render();const field=$('#query');if(field){field.focus();field.setSelectionRange(value.length,value.length)}},350);}});
+document.addEventListener('input',e=>{if(e.target.id==='query'){state.query=e.target.value;state.offset=0;clearTimeout(searchTimer);searchTimer=setTimeout(()=>render(),350);}});
 document.addEventListener('keydown',e=>{if(e.target.id==='path-input'&&e.key==='Enter'){state.path=e.target.value.trim();state.offset=0;state.query='';render();}});
 window.addEventListener('scroll',()=>{state.lastScroll=Date.now();},{passive:true});
 $('#scan-button').innerHTML=icon('scan')+' 扫描磁盘';
