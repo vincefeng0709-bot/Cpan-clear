@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import app
+import junk_catalog
 
 
 class ManagerTests(unittest.TestCase):
@@ -177,6 +178,167 @@ class ManagerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app.no_links(path, False)
 
+    def test_junk_scan_categorizes_and_measures(self):
+        cache = self.root / 'pip' / 'Cache'
+        cache.mkdir(parents=True)
+        (cache / 'pkg.bin').write_bytes(b'x' * 1234)
+        (self.root / 'empty-temp').mkdir()
+        fake_vars = {'home': self.root, 'local': self.root, 'roaming': self.root,
+                     'windir': self.root, 'temp': self.root / 'empty-temp'}
+        with patch.object(junk_catalog, '_VARS', fake_vars):
+            data = junk_catalog.scan_junk()
+        pip = next(c for c in data['categories'] if c['id'] == 'pip')
+        self.assertEqual(pip['bytes'], 1234)
+        self.assertEqual(pip['risk'], 'safe')
+        self.assertEqual(pip['targets'][0]['path'], str(cache))
+        self.assertTrue(any(c['risk'] == 'review' for c in data['categories']))
+        temp = next(c for c in data['categories'] if c['id'] == 'temp')
+        self.assertEqual(temp['bytes'], 0)
+
+    def test_junk_clean_batches_and_tolerates_failures(self):
+        cache = self.root / 'pip' / 'Cache'
+        cache.mkdir(parents=True)
+        old = time.time() - 120
+        for i in range(30):
+            f = cache / f'{i:02d}.bin'
+            f.write_bytes(b'x' * 10)
+            os.utime(f, (old, old))
+        (cache / 'fresh.bin').write_bytes(b'new')
+        def fake_many(chunk):
+            for p in chunk[1:]:
+                Path(p).unlink()
+            return list(chunk[1:]), [(chunk[0], '被占用')] if chunk else []
+        with patch.object(junk_catalog, 'expand_paths', return_value=[cache]), \
+             patch.object(app.windows_integration, 'recycle_many', side_effect=fake_many), \
+             patch.object(self.manager, 'refresh_junk'):
+            self.manager.junk_clean('pip')
+            self.finish()
+        result = self.manager.job['result']
+        self.assertEqual(len(result['done']), 28)
+        self.assertEqual(len(result['errors']), 2)
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(self.manager.job['status'], 'error')
+        for failed in result['errors']:
+            self.assertTrue(Path(failed.split('：')[0]).exists())
+        self.assertTrue((cache / 'fresh.bin').exists())
+        self.assertEqual(len(list(cache.iterdir())), 3)
+        records = list((self.root / 'state').glob('batch-junk-*.json'))
+        self.assertEqual(len(records), 1)
+        record = json.loads(records[0].read_text(encoding='utf-8'))
+        self.assertEqual(record['category'], 'pip')
+        self.assertEqual(record['status'], 'error')
+        self.assertIn('跳过 1 项', record['message'])
+
+    def test_junk_clean_rejects_review_and_unknown_categories(self):
+        with self.assertRaisesRegex(ValueError, '逐项确认'):
+            self.manager.junk_clean('memory-dump')
+        with self.assertRaisesRegex(ValueError, '未知'):
+            self.manager.junk_clean('no-such-category')
+
+    def test_purge_removes_files_permanently(self):
+        p = self.source / 'gone.txt'
+        p.write_text('bye')
+        with patch.object(self.manager, 'refresh_junk'):
+            plan = self.manager.purge_plan([str(p)])
+            self.assertEqual(plan['mode'], 'purge')
+            self.assertEqual(plan['bytes'], 3)
+            self.manager.purge_execute(plan['id'])
+            self.finish()
+        self.assertEqual(self.manager.job['status'], 'done', self.manager.job)
+        self.assertFalse(p.exists())
+        records = list((self.root / 'state').glob('batch-purge-*.json'))
+        self.assertEqual(len(records), 1)
+        record = json.loads(records[0].read_text(encoding='utf-8'))
+        self.assertEqual(record['completed'], 1)
+        self.assertEqual(self.manager.history()[0]['mode'], 'purge')
+
+    def test_batch_plan_rejects_more_than_500(self):
+        paths = [str(self.source / f'{i}.tmp') for i in range(501)]
+        with self.assertRaisesRegex(ValueError, '1–500'):
+            self.manager.purge_plan(paths)
+
+    def test_recycle_history_lists_batch_operations(self):
+        p = self.source / 'a.txt'
+        p.write_text('data')
+        def fake_many(paths):
+            for x in paths:
+                Path(x).unlink()
+            return list(paths), []
+        with patch.object(app.windows_integration, 'recycle_many', side_effect=fake_many), \
+             patch.object(self.manager, 'refresh_junk'):
+            plan = self.manager.recycle_plan([str(p)])
+            self.assertEqual(plan['mode'], 'recycle')
+            self.manager.recycle_execute(plan['id'])
+            self.finish()
+        self.assertEqual(self.manager.job['status'], 'done', self.manager.job)
+        self.assertFalse(p.exists())
+        row = self.manager.history()[0]
+        self.assertEqual(row['mode'], 'recycle')
+        self.assertEqual(row['status'], 'done')
+        self.assertEqual(row['count'], 1)
+        self.assertIn('移入回收站', row['message'])
+
+    def test_summary_stays_responsive_while_new_subtrees_are_scanned(self):
+        big = self.source / 'big'
+        big.mkdir()
+        self.manager.start_scan([str(self.source)])
+        self.finish()
+        real_scan = app.audit.scan
+        def slow_scan(*args, **kwargs):
+            time.sleep(1.2)
+            return real_scan(*args, **kwargs)
+        worst = 0
+        with patch.object(app.audit, 'scan', side_effect=slow_scan):
+            for i in range(3):
+                kid = big / f'kid{i}'
+                kid.mkdir()
+                (kid / 'f.bin').write_bytes(b'y' * 256)
+                failure = []
+                def churn():
+                    try:
+                        self.manager.reconcile_directory(big)
+                    except Exception as exc:
+                        failure.append(exc)
+                worker = threading.Thread(target=churn)
+                worker.start()
+                started = time.monotonic()
+                self.manager.summary()
+                worst = max(worst, time.monotonic() - started)
+                worker.join(15)
+                self.assertFalse(failure, failure)
+        self.assertLess(worst, 0.8, f'summary blocked {worst:.2f}s')
+
+    def test_reconcile_removal_stays_fast_on_large_index(self):
+        parent = self.source / 'wipe'
+        parent.mkdir()
+        (parent / 'keep.txt').write_text('x')
+        self.manager.start_scan([str(self.source)])
+        self.finish()
+        base = app.audit.key(parent)
+        with self.manager.lock:
+            for i in range(2000):
+                child = f'{base}\\d{i:04d}'
+                row = {'path': child, 'parent': str(parent), 'bytes': 1, 'files': 1,
+                       'old_bytes': 1, 'incomplete': 0, 'modified': 'x'}
+                self.manager.index[app.audit.key(child)] = row
+                self.manager.children.setdefault(base, []).append(row)
+        started = time.monotonic()
+        self.manager.reconcile_directory(parent)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0, f'removal sweep took {elapsed:.2f}s')
+        with self.manager.lock:
+            self.assertNotIn(app.audit.key(f'{base}\\d0000'), self.manager.index)
+            self.assertIn(app.audit.key(parent), self.manager.index)
+
+    def test_snapshot_names_do_not_collide(self):
+        (self.source / 'a.txt').write_text('x')
+        self.manager.start_scan([str(self.source)])
+        self.finish()
+        self.manager.start_scan([str(self.source)])
+        self.finish()
+        names = [p.name for p in (self.root / 'reports').glob('scan-*.json')]
+        self.assertEqual(len(names), 2)
+
 
 class ServerTests(unittest.TestCase):
     def test_host_origin_and_token_guards(self):
@@ -201,7 +363,10 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(request('/api/summary', auth)[0], 200)
                 self.assertEqual(request('/api/summary', dict(auth, Origin='https://attacker.example'))[0], 403)
                 self.assertEqual(request('/', {'Host':'attacker.example'})[0], 403)
+                self.assertEqual(request('/', {'Host': f'localhost:{server.server_port}'})[0], 200)
                 self.assertEqual(request('/api/execute', dict(auth, **{'Content-Type':'application/json'}), 'POST', '{"id":"bad"}')[0], 400)
+                self.assertEqual(request('/api/junk', auth)[0], 200)
+                self.assertEqual(request('/api/junk-clean', dict(auth, **{'Content-Type':'application/json'}), 'POST', '{"category":"no-such","confirm":true}')[0], 400)
                 self.assertEqual(request('/../app.py')[0], 404)
                 self.assertEqual(request('/app.js')[0], 200)
             finally:

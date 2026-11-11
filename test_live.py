@@ -43,7 +43,7 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(plan['bytes'], 20)
 
     def test_recycle_changed_file_is_not_deleted(self):
-        with patch.object(self.manager, 'policy', return_value={'allowed': True}), patch.object(app.windows_integration, 'recycle') as recycle:
+        with patch.object(self.manager, 'policy', return_value={'allowed': True}), patch.object(app.windows_integration, 'recycle_many') as recycle, patch.object(self.manager, 'refresh_junk'):
             plan = self.manager.recycle_plan([str(self.scope/'one.txt')])
             (self.scope/'one.txt').write_bytes(b'changed')
             self.manager.recycle_execute(plan['id'])
@@ -56,7 +56,11 @@ class LiveTests(unittest.TestCase):
 
     def test_recycle_success_updates_statistics(self):
         # The adapter is mocked; only our explicitly disposable fixture is removed.
-        with patch.object(self.manager, 'policy', return_value={'allowed': True}), patch.object(app.windows_integration, 'recycle', side_effect=lambda p: Path(p).unlink()):
+        def fake_many(paths):
+            for p in paths:
+                Path(p).unlink()
+            return list(paths), []
+        with patch.object(self.manager, 'policy', return_value={'allowed': True}), patch.object(app.windows_integration, 'recycle_many', side_effect=fake_many), patch.object(self.manager, 'refresh_junk'):
             plan = self.manager.recycle_plan([str(self.scope/'one.txt')])
             self.manager.recycle_execute(plan['id'])
             deadline=time.time()+3
@@ -117,7 +121,9 @@ class LiveTests(unittest.TestCase):
     def test_native_notification_updates_automatically(self):
         if os.name != 'nt':
             self.skipTest('Windows notifications')
-        self.manager.start_monitor()
+        with patch.object(self.manager, 'refresh_junk'):
+            self.manager.start_monitor()
+        self.addCleanup(self.manager.stop_monitor)
         time.sleep(.15)
         (self.nested/'two.txt').unlink()
         deadline = time.monotonic()+8

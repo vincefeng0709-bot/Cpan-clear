@@ -18,6 +18,7 @@ import time
 from urllib.parse import urlsplit, parse_qs
 import webbrowser
 
+import junk_catalog
 import storage_audit as audit
 import windows_integration
 
@@ -118,10 +119,15 @@ class Manager:
         self.revision = 0
         self.live_updated = None
         self.watchers = []
+        self.watch_attempts = {}
+        self.watch_generation = 0
         self.monitor_stop = threading.Event()
         self.monitor_enabled = False
         self.pending = set()
         self.monitor = {'status': 'off', 'message': '自动更新未启动'}
+        self.junk_lock = threading.Lock()
+        self.junk_data = {'status': 'idle', 'categories': []}
+        self.junk_thread = None
         self.load_latest()
 
     def load_latest(self):
@@ -143,21 +149,49 @@ class Manager:
             self.watch_roots()
 
     def watch_roots(self):
-        for watcher in self.watchers:
-            watcher.close()
-        self.watchers = []
-        self.monitor = {'status': 'watching', 'message': '正在监听当前扫描范围'}
-        for root in self.data['roots']:
-            try:
-                no_links(root)
-                self.watchers.append(windows_integration.DirectoryWatch(root, self.queue_change, self.watch_failed))
-            except (OSError, ValueError) as exc:
-                self.watch_failed(root, str(exc))
+        with self.lock:
+            self.watch_generation += 1
+            for watcher in self.watchers:
+                watcher.close()
+            self.watchers = []
+            self.watch_attempts = {}
+            self.monitor = {'status': 'watching', 'message': '正在监听当前扫描范围'}
+            roots = list(self.data['roots'])
+        for root in roots:
+            self._start_watcher(root)
+
+    def _start_watcher(self, root):
+        try:
+            no_links(root)
+            watcher = windows_integration.DirectoryWatch(root, self.queue_change, self.watch_failed)
+        except (OSError, ValueError) as exc:
+            self.watch_failed(root, str(exc))
+            return
+        with self.lock:
+            self.watchers.append(watcher)
+            self.watch_attempts[audit.key(root)] = 0
 
     def watch_failed(self, root, message):
         with self.lock:
-            self.monitor = {'status': 'limited', 'message': f'{root}：{message}'}
+            key = audit.key(root)
+            attempts = self.watch_attempts.get(key, 0)
+            generation = self.watch_generation
+            retry = self.monitor_enabled and not self.monitor_stop.is_set() and attempts < 4
+            if retry:
+                self.watch_attempts[key] = attempts + 1
+                self.monitor = {'status': 'limited', 'message': f'{root}：{message}；正在自动重连'}
+            else:
+                self.monitor = {'status': 'limited', 'message': f'{root}：{message}'}
             self.revision += 1
+        if retry:
+            delay = min(30, 2 ** attempts)
+            def rebuild():
+                time.sleep(delay)
+                with self.lock:
+                    stale = generation != self.watch_generation or not self.monitor_enabled or self.monitor_stop.is_set()
+                if not stale:
+                    self._start_watcher(root)
+            threading.Thread(target=rebuild, daemon=True).start()
 
     def queue_change(self, changed):
         if any(audit.within(changed, p) for p in (self.reports, self.state)):
@@ -172,21 +206,24 @@ class Manager:
 
     def start_monitor(self):
         self.monitor_enabled = True
+        self.refresh_junk()
         self.watch_roots()
         # Reconcile known large-file parents at startup, catching deletions while closed.
         self.pending.update(audit.key(Path(r['path']).parent) for r in self.data['largest'])
         self.pending.update(audit.key(r) for r in self.data['roots'])
         def run():
-            while not self.monitor_stop.wait(1.5):
+            while not self.monitor_stop.wait(2.5):
                 if self.job['status'] == 'running':
                     continue
                 with self.lock:
                     self.pending.update(audit.key(root) for root in self.data['roots'] if not Path(root).exists() and not self.index.get(audit.key(root), {}).get('missing'))
-                    batch = list(self.pending)[:30]
+                    batch = list(self.pending)[:12]
                     self.pending.difference_update(batch)
                 for parent in batch:
                     try:
                         self.reconcile_directory(parent)
+                    except PermissionError:
+                        pass  # 系统目录拒绝读取，无法对账；之后有新事件时会自然重试
                     except (OSError, ValueError) as exc:
                         self.watch_failed(parent, str(exc))
         threading.Thread(target=run, daemon=True).start()
@@ -197,52 +234,86 @@ class Manager:
             watcher.close()
 
     def reconcile_directory(self, path):
-        """Refresh only immediate entries and new subtrees; propagate size deltas upward."""
+        """Refresh only immediate entries and new subtrees; propagate size deltas upward.
+
+        Two phases: filesystem reads run without the lock (the slow part), then a
+        short locked section applies deltas against the freshest index state, so
+        HTTP handlers never starve behind a directory scan.
+        """
+        p = Path(path)
         with self.lock:
-            p = Path(path)
             while audit.key(p) not in self.index and p != p.parent:
                 p = p.parent
             normalized = audit.key(p)
             if normalized not in self.index:
                 return False
-            row = self.index[normalized]
-            if not p.exists() and row['parent']:
-                return self.reconcile_directory(row['parent'])
+            row_path = self.index[normalized]['path']
+            parent_path = self.index[normalized]['parent']
+        if not p.exists() and parent_path:
+            return self.reconcile_directory(parent_path)
+        # Phase 1 (no lock): read the directory and scan unseen subtrees.
+        direct, dirs, skipped = [], set(), 0
+        if p.exists():
+            no_links(p)
+            with os.scandir(p) as entries:
+                for e in entries:
+                    if any(audit.within(e.path, excluded) for excluded in (self.reports, self.state)):
+                        skipped += 1
+                        continue
+                    s = e.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(s.st_mode) or getattr(s, 'st_file_attributes', 0) & (audit.REPARSE | audit.OFFLINE | audit.RECALL):
+                        skipped += 1
+                    elif stat.S_ISDIR(s.st_mode):
+                        dirs.add(audit.key(e.path))
+                    elif stat.S_ISREG(s.st_mode):
+                        direct.append({'path': e.path, 'bytes': s.st_size, 'modified': audit.modified_time(s.st_mtime), '_old': s.st_mtime < time.time()-30*86400})
+        subtree_rows, new_large = [], []
+        for directory in sorted(dirs):
+            if directory in self.index:
+                continue
+            try:
+                new = audit.scan([directory], excluded=[str(self.reports), str(self.state)], top=2000)
+            except PermissionError:
+                # 无权限子目录记为不完整占位行，兄弟目录的对账不受影响。
+                try:
+                    mtime = os.stat(directory).st_mtime
+                except OSError:
+                    mtime = 0
+                subtree_rows.append({'path': directory, 'parent': row_path, 'bytes': 0, 'files': 0,
+                                     'old_bytes': 0, 'incomplete': 1, 'modified': audit.modified_time(mtime)})
+                continue
+            new['directories'][0]['parent'] = row_path
+            subtree_rows.extend(new['directories'])
+            new_large.extend(new['largest'])
+        # Phase 2 (short lock): re-read the live row, apply, propagate.
+        with self.lock:
+            row = self.index.get(normalized)
+            if row is None:
+                return False
             old = dict(row)
-            direct, dirs, skipped = [], set(), 0
-            if p.exists():
-                no_links(p)
-                with os.scandir(p) as entries:
-                    for e in entries:
-                        if any(audit.within(e.path, excluded) for excluded in (self.reports, self.state)):
-                            skipped += 1
-                            continue
-                        s = e.stat(follow_symlinks=False)
-                        if stat.S_ISLNK(s.st_mode) or getattr(s, 'st_file_attributes', 0) & (audit.REPARSE | audit.OFFLINE | audit.RECALL):
-                            skipped += 1
-                        elif stat.S_ISDIR(s.st_mode):
-                            dirs.add(audit.key(e.path))
-                        elif stat.S_ISREG(s.st_mode):
-                            direct.append({'path': e.path, 'bytes': s.st_size, 'modified': audit.modified_time(s.st_mtime), '_old': s.st_mtime < time.time()-30*86400})
             previous_children = self.children.get(normalized, [])
             removed = [c['path'] for c in previous_children if audit.key(c['path']) not in dirs]
             if removed:
-                for name in list(self.index):
-                    if any(audit.within(name, r) for r in removed):
-                        self.index.pop(name, None)
-                        self.children.pop(name, None)
-            additions, new_large = [], []
-            for directory in dirs:
-                if directory not in self.index:
-                    new = audit.scan([directory], excluded=[str(self.reports), str(self.state)], top=2000)
-                    new['directories'][0]['parent'] = row['path']
-                    additions.extend(new['directories'])
-                    new_large.extend(new['largest'])
-                    for child in new['directories']:
-                        self.index[audit.key(child['path'])] = child
-                        if child['parent'] and audit.key(child['parent']) != normalized:
-                            self.children.setdefault(audit.key(child['parent']), []).append(child)
-            children = [self.index[d] for d in dirs]
+                # children lists form a complete tree (scan rows all carry a parent, and
+                # set_data/reconcile register every row), so subtree removal is a BFS over
+                # the affected keys; sweeping the whole index here held the lock for minutes.
+                stack = [audit.key(r) for r in removed]
+                while stack:
+                    k = stack.pop()
+                    if self.index.pop(k, None) is None:
+                        continue
+                    stack.extend(audit.key(c['path']) for c in self.children.pop(k, []))
+            removed_keys = {audit.key(r) for r in removed}
+            dead_prefixes = tuple(k if k.endswith('\\') else k + '\\' for k in removed_keys)
+            additions = []
+            for child in subtree_rows:
+                ckey = audit.key(child['path'])
+                if ckey not in self.index:
+                    self.index[ckey] = child
+                    if child['parent'] and audit.key(child['parent']) != normalized:
+                        self.children.setdefault(audit.key(child['parent']), []).append(child)
+                    additions.append(child)
+            children = [self.index[d] for d in dirs if d in self.index]
             self.children[normalized] = children
             row.update(direct_bytes=sum(f['bytes'] for f in direct),
                        bytes=sum(f['bytes'] for f in direct)+sum(c['bytes'] for c in children),
@@ -256,7 +327,11 @@ class Manager:
                 for field in ('bytes', 'files', 'old_bytes', 'incomplete'):
                     ancestor[field] += row[field]-old[field]
                 parent = ancestor['parent']
-            largest = [r for r in self.data['largest'] if audit.key(Path(r['path']).parent) != normalized and not any(audit.within(r['path'], x) for x in removed)]
+            largest = []
+            for r in self.data['largest']:
+                if audit.key(Path(r['path']).parent) == normalized or removed_keys and audit.key(r['path']).startswith(dead_prefixes):
+                    continue
+                largest.append(r)
             largest.extend({k:v for k,v in f.items() if k != '_old'} for f in direct)
             largest.extend(new_large)
             largest.sort(key=lambda r:(-r['bytes'], r['path'].lower()))
@@ -299,15 +374,19 @@ class Manager:
             return {'allowed': False, 'reason': str(exc)}
 
     def summary(self):
+        # Copy state under the lock only; policy() and volumes() touch the filesystem.
         with self.lock:
             d = self.data
-            recs = [dict(r, policy=self.policy(r['path'])) for r in d.get('recommendations', [])]
-            return {'volumes': self.volumes(), 'snapshot': self.snapshot, 'finished': d.get('finished'),
-                    'roots': d['roots'], 'files': d['files_scanned'], 'directories': len(d['directories']),
-                    'issues': d['issue_counts'], 'recommendations': recs, 'job': dict(self.job),
-                    'home': str(Path.home()), 'comparison': d.get('comparison', {}),
-                    'revision': self.revision, 'live_updated': self.live_updated, 'monitor': dict(self.monitor),
-                    'scopes': [dict(self.index.get(audit.key(root), {}), path=root) for root in d['roots']]}
+            payload = {'snapshot': self.snapshot, 'finished': d.get('finished'),
+                       'roots': list(d['roots']), 'files': d['files_scanned'], 'directories': len(d['directories']),
+                       'issues': dict(d['issue_counts']), 'job': dict(self.job),
+                       'home': str(Path.home()), 'comparison': d.get('comparison', {}),
+                       'revision': self.revision, 'live_updated': self.live_updated, 'monitor': dict(self.monitor),
+                       'scopes': [dict(self.index.get(audit.key(root), {}), path=root) for root in d['roots']],
+                       'rec_rows': [dict(r) for r in d.get('recommendations', [])]}
+        payload['volumes'] = self.volumes()
+        payload['recommendations'] = [dict(r, policy=self.policy(r['path'])) for r in payload.pop('rec_rows')]
+        return payload
 
     def browse(self, path, query='', offset=0, sort='size'):
         p = no_links(path)
@@ -344,7 +423,15 @@ class Manager:
                 rows.append(row)
             except (OSError, ValueError, KeyError):
                 pass
-        return rows
+        for p in sorted(self.state.glob('batch-*.json'), reverse=True)[:50]:
+            try:
+                row = json.loads(p.read_text(encoding='utf-8'))
+                rows.append({'id': '', 'mode': row.get('mode', 'recycle'), 'status': row.get('status', 'done'),
+                             'message': row.get('message', ''), 'time': row.get('time', ''),
+                             'completed': row.get('completed', 0), 'count': row.get('count', 0)})
+            except (OSError, ValueError):
+                pass
+        return sorted(rows, key=lambda r: r.get('time', ''), reverse=True)
 
     def inventory(self, source):
         p = no_links(source)
@@ -420,9 +507,9 @@ class Manager:
                 stack.extend(item.iterdir())
         return sorted(entries, key=lambda x: audit.key(x['path']))
 
-    def recycle_plan(self, paths):
-        if not isinstance(paths, list) or not 1 <= len(paths) <= 100:
-            raise ValueError('每批请选择 1–100 项')
+    def _batch_plan(self, paths, mode):
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 500:
+            raise ValueError('每批请选择 1–500 项')
         candidates = sorted({audit.key(no_links(p)) for p in paths}, key=len)
         sources = []
         for candidate in candidates:
@@ -434,12 +521,18 @@ class Manager:
             items.append({'path': str(source), 'manifest': manifest,
                           'bytes': sum(e['fingerprint'][0] for e in manifest if not e['directory'])})
         ident = secrets.token_hex(16)
-        plan = {'id': ident, 'mode': 'recycle', 'created': time.time(), 'items': items}
+        plan = {'id': ident, 'mode': mode, 'created': time.time(), 'items': items}
         with self.lock:
             self.plans = {k: v for k, v in self.plans.items() if time.time()-v['created'] < 600}
             self.plans[ident] = plan
-        return {'id': ident, 'items': [{'path': i['path'], 'bytes': i['bytes']} for i in items],
+        return {'id': ident, 'mode': mode, 'items': [{'path': i['path'], 'bytes': i['bytes']} for i in items],
                 'bytes': sum(i['bytes'] for i in items)}
+
+    def recycle_plan(self, paths):
+        return self._batch_plan(paths, 'recycle')
+
+    def purge_plan(self, paths):
+        return self._batch_plan(paths, 'purge')
 
     def recycle_execute(self, ident):
         with self.lock:
@@ -449,26 +542,185 @@ class Manager:
             def work():
                 errors, done = [], []
                 self.job['total'] = len(plan['items'])
+                self.job['message'] = '核对所选文件…'
+                verified = []
                 for item in plan['items']:
                     if self.cancel.is_set():
-                        errors.append('剩余项目已取消')
                         break
                     try:
                         if self.recycle_manifest(item['path']) != item['manifest']:
                             raise ValueError('预览后文件发生变化，请重新预览')
-                        windows_integration.recycle(item['path'])
+                        verified.append(item)
+                    except (OSError, ValueError) as exc:
+                        errors.append(item['path'] + '：' + str(exc))
+                for start in range(0, len(verified), 25):
+                    if self.cancel.is_set():
+                        break
+                    chunk = verified[start:start+25]
+                    done_list, failed = windows_integration.recycle_many([i['path'] for i in chunk])
+                    done.extend(done_list)
+                    errors.extend(f'{p}：{msg}' for p, msg in failed)
+                    self.job['done'] = self.job.get('done', 0) + len(done_list)
+                    self.job['message'] = f'已回收 {self.job["done"]}/{len(verified)} 项'
+                    for p in done_list:
+                        self.queue_change(p)
+                    for parent in {str(Path(p).parent) for p in done_list}:
+                        try:
+                            self.reconcile_directory(parent)
+                        except (OSError, ValueError):
+                            pass
+                status = 'cancelled' if self.cancel.is_set() else ('error' if errors else 'done')
+                result = {'done': done, 'errors': errors}
+                save_json(self.state / ('batch-recycle-' + ident + '.json'),
+                          {'mode': 'recycle', 'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'status': status,
+                           'message': f'移入回收站 {len(done)} 项' + (f'，{len(errors)} 项失败' if errors else ''),
+                           'completed': len(done), 'count': len(plan['items']), 'result': result})
+                self.job['result'] = result
+                self.refresh_junk()
+                if self.cancel.is_set():
+                    raise InterruptedError(f'已停止：完成 {len(done)} 项，其余未处理')
+                if errors:
+                    raise ValueError('已处理 %d 项；%s' % (len(done), '；'.join(errors[:5])))
+            self.begin('recycle', work, ident)
+            self.plans.pop(ident, None)
+
+    def purge_execute(self, ident):
+        with self.lock:
+            plan = self.plans.get(ident)
+            if not plan or plan.get('mode') != 'purge' or time.time()-plan['created'] > 600:
+                raise ValueError('预览已失效，请重新选择')
+            def work():
+                errors, done = [], []
+                self.job['total'] = len(plan['items'])
+                for item in plan['items']:
+                    if self.cancel.is_set():
+                        break
+                    try:
+                        if self.recycle_manifest(item['path']) != item['manifest']:
+                            raise ValueError('预览后文件发生变化，请重新预览')
+                        p = no_links(item['path'])
+                        if p.is_dir():
+                            shutil.rmtree(p)
+                        else:
+                            p.unlink()
                         done.append(item['path'])
                     except (OSError, ValueError) as exc:
                         errors.append(item['path'] + '：' + str(exc))
+                    self.job['done'] = self.job.get('done', 0) + 1
+                    self.job['message'] = f'已删除 {self.job["done"]}/{len(plan["items"])} 项'
                     self.queue_change(item['path'])
-                    self.reconcile_directory(str(Path(item['path']).parent))
-                    self.job['done'] = self.job.get('done', 0)+1
-                self.job['result'] = {'done': done, 'errors': errors}
-                save_json(self.state / ('recycle-' + ident + '.json'), self.job['result'])
+                    try:
+                        self.reconcile_directory(str(Path(item['path']).parent))
+                    except (OSError, ValueError):
+                        pass
+                status = 'cancelled' if self.cancel.is_set() else ('error' if errors else 'done')
+                result = {'done': done, 'errors': errors}
+                save_json(self.state / ('batch-purge-' + ident + '.json'),
+                          {'mode': 'purge', 'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'status': status,
+                           'message': f'永久删除 {len(done)} 项' + (f'，{len(errors)} 项失败' if errors else ''),
+                           'completed': len(done), 'count': len(plan['items']), 'result': result})
+                self.job['result'] = result
+                self.refresh_junk()
+                if self.cancel.is_set():
+                    raise InterruptedError(f'已停止：删除 {len(done)} 项，其余未处理')
                 if errors:
-                    raise ValueError('已处理 %d 项；%s' % (len(done), '；'.join(errors)))
-            self.begin('recycle', work, ident)
+                    raise ValueError('已删除 %d 项；%s' % (len(done), '；'.join(errors[:5])))
+            self.begin('purge', work, ident)
             self.plans.pop(ident, None)
+
+    def junk(self):
+        with self.junk_lock:
+            return dict(self.junk_data)
+
+    def refresh_junk(self):
+        with self.junk_lock:
+            if self.junk_thread and self.junk_thread.is_alive():
+                return
+            self.junk_data['status'] = 'scanning'
+            def run():
+                try:
+                    data = junk_catalog.scan_junk()
+                    data['recycle'] = windows_integration.recycle_bin_info()
+                    data['status'] = 'ready'
+                except Exception as exc:
+                    data = {'status': 'error', 'categories': [], 'message': str(exc),
+                            'recycle': windows_integration.recycle_bin_info()}
+                with self.junk_lock:
+                    self.junk_data = data
+                with self.lock:
+                    self.revision += 1
+            self.junk_thread = threading.Thread(target=run, daemon=True)
+            self.junk_thread.start()
+
+    def junk_clean(self, category_id):
+        entry = junk_catalog.category(category_id)
+        if not entry:
+            raise ValueError('未知的清理类别')
+        if entry['risk'] != 'safe':
+            raise ValueError('此类别需逐项确认，请查看明细后手动选择具体文件')
+        targets = junk_catalog.expand_paths(entry)
+        if not targets:
+            raise ValueError('此类别当前没有可清理的内容')
+        def work():
+            errors, done, skipped, jobs = [], [], 0, []
+            for path in targets:
+                p = Path(path)
+                try:
+                    if p.is_dir():
+                        with os.scandir(p) as it:
+                            for e in it:
+                                try:
+                                    s = e.stat(follow_symlinks=False)
+                                    if stat.S_ISLNK(s.st_mode) or getattr(s, 'st_file_attributes', 0) & (audit.REPARSE | audit.OFFLINE | audit.RECALL):
+                                        skipped += 1
+                                    elif time.time() - s.st_mtime < 60:
+                                        skipped += 1
+                                    else:
+                                        jobs.append(e.path)
+                                except OSError:
+                                    skipped += 1
+                    else:
+                        s = p.stat(follow_symlinks=False)
+                        if not stat.S_ISLNK(s.st_mode) and time.time() - s.st_mtime >= 60:
+                            jobs.append(str(p))
+                        else:
+                            skipped += 1
+                except OSError as exc:
+                    errors.append(f'{p}：{exc}')
+            self.job['total'] = len(jobs)
+            for start in range(0, len(jobs), 25):
+                if self.cancel.is_set():
+                    break
+                chunk = jobs[start:start+25]
+                done_list, failed = windows_integration.recycle_many(chunk)
+                done.extend(done_list)
+                errors.extend(f'{p}：{msg}' for p, msg in failed)
+                self.job['done'] = self.job.get('done', 0) + len(done_list)
+                self.job['message'] = f'已清理 {self.job["done"]}/{len(jobs)} 项'
+                for p in done_list:
+                    self.queue_change(p)
+                for parent in {str(Path(p).parent) for p in done_list}:
+                    try:
+                        self.reconcile_directory(parent)
+                    except (OSError, ValueError):
+                        pass
+            status = 'cancelled' if self.cancel.is_set() else ('error' if errors else 'done')
+            message = f'{entry["name"]}：清理 {len(done)} 项'
+            if skipped:
+                message += f'，跳过 {skipped} 项'
+            if errors:
+                message += f'，{len(errors)} 项失败'
+            save_json(self.state / ('batch-junk-' + time.strftime('%Y%m%d-%H%M%S-') + secrets.token_hex(4) + '.json'),
+                      {'mode': 'junk', 'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'status': status,
+                       'message': message, 'completed': len(done), 'count': len(done) + len(errors),
+                       'category': entry['id'], 'result': {'done': done, 'errors': errors, 'skipped': skipped}})
+            self.job['result'] = {'done': done, 'errors': errors, 'skipped': skipped}
+            self.refresh_junk()
+            if self.cancel.is_set():
+                raise InterruptedError(f'已停止：清理 {len(done)} 项，其余未处理')
+            if errors:
+                raise ValueError('已清理 %d 项；%s' % (len(done), '；'.join(errors[:5])))
+        self.begin('junk', work, 'junk-' + time.strftime('%Y%m%d-%H%M%S-') + secrets.token_hex(4))
 
     def begin(self, kind, worker, ident=None):
         with self.lock:
@@ -498,7 +750,7 @@ class Manager:
             self.job['message'] = '生成建议与历史快照'
             data['recommendations'] = audit.recommendations(data)
             data['comparison'] = audit.compare(data, self.data) if self.snapshot else {'message': '首次扫描', 'rows': []}
-            name = 'scan-' + time.strftime('%Y%m%d-%H%M%S') + '.json'
+            name = 'scan-' + audit.datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.json'
             save_json(self.reports / name, data)
             audit.write_report(data, self.reports / 'latest.html')
             self.set_data(data, name)
@@ -640,11 +892,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def authorized(self, api=False):
-        expected = f'127.0.0.1:{self.server.server_port}'
-        if self.headers.get('Host') != expected:
+        port = self.server.server_port
+        host = self.headers.get('Host', '')
+        if host not in {f'127.0.0.1:{port}', f'localhost:{port}'}:
             return False
         origin = self.headers.get('Origin')
-        if origin and origin != 'http://' + expected:
+        if origin and origin != 'http://' + host:
             return False
         return not api or secrets.compare_digest(self.headers.get('X-Spacewell-Token', ''), self.server.token)
 
@@ -668,6 +921,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply({'counts': m.data['issue_counts'], 'items': m.data['issues']})
             if url.path == '/api/history':
                 return self.reply(m.history())
+            if url.path == '/api/junk':
+                return self.reply(m.junk())
             if url.path == '/api/policy':
                 return self.reply(m.policy(params['path']))
             if url.path == '/api/snapshots':
@@ -705,6 +960,21 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get('confirm') is not True:
                     raise ValueError('请先确认所选文件')
                 m.recycle_execute(body['id'])
+            elif route == '/api/purge-plan':
+                return self.reply(m.purge_plan(body['paths']))
+            elif route == '/api/purge-execute':
+                if body.get('confirm') is not True:
+                    raise ValueError('请先确认所选文件')
+                m.purge_execute(body['id'])
+            elif route == '/api/junk-clean':
+                if body.get('confirm') is not True:
+                    raise ValueError('请确认要清理的项目')
+                m.junk_clean(body['category'])
+            elif route == '/api/recycle-empty':
+                if body.get('confirm') is not True:
+                    raise ValueError('请确认清空回收站')
+                windows_integration.empty_recycle_bin()
+                m.refresh_junk()
             elif route == '/api/plan':
                 return self.reply(m.plan(body['source'], body['target'], body['mode']))
             elif route == '/api/execute':
@@ -752,6 +1022,7 @@ def main():
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--no-browser', action='store_true')
     args = parser.parse_args()
+    print('正在启动 Spacewell…（加载上次扫描结果可能需要几秒）', flush=True)
     server = make_server(args.port)
     server.manager.start_monitor()
     url = f'http://127.0.0.1:{server.server_port}'
